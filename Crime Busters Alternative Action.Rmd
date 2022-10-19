@@ -1,0 +1,897 @@
+---
+title: "Crime Busters Drugs"
+output: html_document
+date: '2022-10-08'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{R}
+library(tidyverse)
+library(tsibble)
+library(feasts)
+library(fpp3)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(janitor)
+library(bbplot)
+data = read_csv("Clearances_data.csv")
+```
+
+```{R}
+data$Date = as.Date(data$`Month Year`, "%d/%m/%Y")
+```
+
+```{R}
+data$Month = yearmonth(data$Date)
+alternative.df = filter(data, `Police Action` == "Alternative Action")
+alternative.df
+```
+
+
+
+
+```{R}
+library(data.table)
+data_v2 <- setDT(alternative.df)[ , .(Clearances_month = sum(Clearances)), by = Month]
+data_v2
+```
+
+```{R}
+data_v3 <- data_v2 %>%
+  as_tsibble(index=Month) %>%
+  arrange(., Month) 
+data_v3
+```
+
+
+Plot whole data, plus seasonal data:
+
+```{R}
+data_v3 %>%
+ggplot(aes(Month, Clearances_month))+geom_line() 
+data_v3 %>%
+gg_season(Clearances_month, labels = "both")
+```
+
+General plot shows increasing trend, arguably greater variability but perhaps only post MODA changes (August 2019).
+
+Seasonal plot shows that possibly number of alternative actions is highest at the end of the year, and lowest at the start
+
+We now filter our dataset, to only include data pre-MODA changes:
+
+```{R}
+pre_moda <- data_v3 %>%
+  filter(Month >= yearmonth("2013 Mar"), Month <= yearmonth("2019 Jul"))
+pre_moda
+```
+
+Within per_moda, we need to create a training set and a test set to test model accuracy. Let's use the last year (roughly 20% of the data) as test data
+
+```{R}
+training <- pre_moda %>%
+  filter(Month >= yearmonth("2013 Mar"), Month <= yearmonth("2018 Jul"))
+training
+```
+
+We can now analyse this training set and fit models!
+
+```{R}
+training %>%
+ggplot(aes(Month, Clearances_month))+geom_line()+geom_area(fill = scales::hue_pal()(1), alpha = 0.4) +
+  bbc_style() +
+  labs(title = 'Alternative Actions over Time',
+       x = 'Time', y = 'Alternative Actions') +
+  theme(axis.title = element_text(size = 20))
+ggsave('test2.png')
+
+data_v3 %>%
+gg_season(Clearances_month, labels = "both") +
+  bbc_style() +
+  labs(title = 'Seasonal Variation by Year',
+       x = 'Month', y = 'Alternative Actions') +
+  theme(axis.title = element_text(size = 20))
+ggsave('test.png')
+```
+
+Variability is not constant, which is a big no. We can transform this data however, using a box_cox transformation (feel free to check it out further if you guys have questions)
+
+```{R}
+lambda <- training %>%
+features(Clearances_month, features = guerrero) %>%
+pull(lambda_guerrero)
+training %>% autoplot(box_cox(Clearances_month, lambda))
+training %>% autoplot(log(Clearances_month))
+```
+
+Box_cox transformation is the best we're gonna get- let's stick with this.
+
+Let's first fit some ETS (Error, Trend, Seasonality) models:
+
+```{R}
+ETSmodels <- training %>%
+  model(
+    Additive = ETS(box_cox(Clearances_month, lambda) ~ 
+                        error("A") + trend("A") + season("A")),
+    Additive_Dampened = ETS(box_cox(Clearances_month, lambda) ~
+                           error("A") + trend("Ad") + season("A")),
+    Multiplicative = ETS(box_cox(Clearances_month, lambda) ~ error("M") + 
+                                        trend("A") + season("M")),
+    Multiplicative_Damped = ETS(box_cox(Clearances_month, lambda) ~ 
+                        error("M") + trend("Ad") + season("M")),
+    ets = ETS(box_cox(Clearances_month, lambda))
+        )
+ETSmodels %>% pivot_longer(everything(), names_to = "Model_name",
+values_to = "Orders")
+report(ETSmodels)
+```
+
+AICc is really the main information criteria- lower AICc=better model. In this case our Additive (which is the same as our automated model) result in the lowest AICc.
+
+We now look at forecast accuracy on our test set (the last year before MODA changes)
+
+
+```{R}
+forecastETS <- ETSmodels %>%
+  forecast(h=12)
+accuracy(forecastETS, pre_moda) %>%
+  select(.model, RMSE, MAE, MAPE, MASE)
+```
+
+All 4 are measures of error- lower=better. Additive performs best. Overall, we will go with a Additive model, as it is the best fit to our data.
+
+
+We now look at ARIMA models. We first need to check if we need seasonal differencing and differencing (as ARIMA models assume that data is stationary, ie not changing in level over time). We can use the below code to see if we need seasonal differencing:
+
+```{R}
+training %>%
+  features(box_cox(Clearances_month, lambda), unitroot_nsdiffs)
+```
+
+This tells us we need 1 seasonal difference (as we are working with monthly data, we apply a seasonal difference of 12)
+
+```{R}
+training %>%
+autoplot(difference(box_cox(Clearances_month, lambda), 12)) +
+labs(title = "Seasonally Differened Series")
+```
+
+We can see if a further difference is required:
+
+```{R}
+training %>%
+  features(difference(box_cox(Clearances_month, lambda), 12), unitroot_ndiffs)
+```
+
+This tells us no more differencing necessary- so we are good to go!
+
+We can now see which ARIMA model would be best- we can find 2 models manually, then also use R's automated function:
+
+
+```{R}
+training %>%
+gg_tsdisplay(difference(box_cox(Clearances_month, lambda), 12),
+plot_type = "partial", lag_max = 36)
+```
+
+ACF plot shows 1 significant lag and 1 significant seasonal lag (at 12). Suggests an ARIMA(0,0,5)(0,1,1)[12] would be suitable.
+
+PACF shows 1 significant lag and 1 significant seasonal lag (at 12). Suggests an ARIMA(1,0,0)(1,1,0)[12] would be suitable. 
+
+Above are our two manually suggested models. We now compare these to R's automated models, to see what model is best:
+
+```{R}
+fit <- training %>%
+  model(ARIMA005011 = ARIMA(box_cox(Clearances_month, lambda) ~ pdq(0, 0, 5) + PDQ(0,1,1)),
+        ARIMA100110 = ARIMA(box_cox(Clearances_month, lambda) ~ pdq(1, 0, 0) + PDQ(1,1,0)),
+        stepwise = ARIMA(box_cox(Clearances_month, lambda)),
+        search = ARIMA(box_cox(Clearances_month, lambda), stepwise = FALSE))
+fit
+fit %>% pivot_longer(everything(), names_to = "Model_name",
+values_to = "Orders")
+```
+
+Search function recommends ARIMA(3,0,0)(0,1,1)[12]
+Stepwise function recommends ARIMA(1,0,1)(0,1,1)[12] **Note: knit the document to see this!**
+
+We can now see which model is best:
+
+```{R}
+glance(fit)
+```
+
+Search has best AICc value- search comes out on top.
+
+```{R}
+forecast <- fit %>%
+  forecast(h=12)
+accuracy(forecast, pre_moda) %>%
+  select(.model, RMSE, MAE, MAPE, MASE)
+```
+
+Search and stepwise performs best in terms of accuracy to test data. Therefore, as it was best in model fit and best in forecast accuracy, we will choose search, which was ARIMA(3,0,0)(0,1,1)[12]
+
+**Go over residual diagnostics**
+
+We now look at residual diagnostics to ensure our models don't violate any assumptions:
+
+ETS:
+
+```{R}
+ETSmodels %>%
+  select(Additive) %>%
+  report()
+```
+
+```{R}
+ETS_residuals <- ETSmodels %>%
+  select(Additive) %>%
+  gg_tsresiduals()
+ETS_residuals
+```
+
+```{R}
+ljung_ETS <- ETSmodels %>% 
+  select(Multiplicative) %>%
+  augment() %>%
+features(.resid, ljung_box, lag = 24, dof = 16)
+ljung_ETS
+```
+
+p-value less than 0.05, so this model fails the Ljung-box test- we don’t have enough evidence to suggest that the residuals of the ETS model resemble a white-noise series. The model can still be useful for forecasting, but the prediction intervals may not be accurate due to correlated residuals.
+
+ARIMA:
+
+```{R}
+fit %>%
+  select(search) %>%
+  report()
+```
+
+```{R}
+ARIMA_residuals <- fit %>%
+  select(search) %>%
+  gg_tsresiduals()
+ARIMA_residuals
+```
+
+```{R}
+ljung_ARIMA <- fit %>% 
+  select(search) %>%
+  augment() %>%
+features(.resid, ljung_box, lag = 24, dof = 5)
+ljung_ARIMA
+```
+
+p-value over 0.05, so we have enough evidence to suggest that the residuals of the ARIMA model resemble a white-noise series.
+
+Therefore: our ARIMA model is best!!
+
+Fitted model:
+
+```{R}
+fit %>%
+  select(search) %>%
+  report()
+```
+
+$y_t = 42.3 + 0.44\epsilon_{t-1} + 0.67\epsilon_{t-2} + 0.36\epsilon_{t-3} - 0.53\epsilon_{t-12} + \epsilon_t$ , where $\epsilon_t$ is estimated to be a white noise series with mean 0 and a variance of 1928.
+
+We can now produce forecasts for post-MODA changes, and compare to the actual data.
+
+```{R}
+best_fc <- pre_moda %>%
+  model(ARIMA101110 = ARIMA(box_cox(Clearances_month, lambda) ~ pdq(1, 0, 1) + PDQ(1,1,0))) %>%
+  forecast(h = 24)
+# best_fc %>%
+#   autoplot(data_v3, level = 95) + ggtitle ("Model Comparison")  + 
+#   ylab ('Alternative Actions') + 
+#   xlab ('Time (Month)')
+
+best_fc %>%
+  autoplot(data_v3, level = 90) + ggtitle ("Model Comparison")  +
+  ylab ('Alternative Actions') +
+  xlab ('Time (Month)') + geom_vline(xintercept =  (as.numeric(as.Date(yearmonth("2019 Aug")))- 20),size = 1.6, lty = 1)+
+    annotate(x=yearmonth("Aug 2019"),y=+Inf,label="MODA Implemented",vjust=2,geom="label") + bbc_style() + 
+  theme(legend.position = 'none',
+        axis.title = element_text(size = 20),
+        plot.subtitle = element_text(size =20)) +
+  geom_area(data = data_v2 ,aes(y = Clearances_month, fill = (Month < yearmonth("2019 Aug"))), alpha = .4) +
+  labs(subtitle = 'With 95% Projections') +
+  geom_vline(xintercept = as.numeric(yearmonth('2020 Apr')))
+ggsave('test4.png')
+```
+
+Early pandemic- number of alternative actins far above prediction interval. However, following this, it seems pretty close to our predictions... hasn't made much of a difference?
+
+
+
+
+
+
+
+
+## My idea to Monte-Carlo simulate the probability of observing what we saw. 
+
+We have a look at the distribution of steps taken each month given the position of the month prior (I.e. the distribution of residuals with respect to the value before).
+
+```{r residuals prior}
+# data_v3
+data_v2
+
+data.premoda = data_v2 %>% 
+  filter(Month < yearmonth('2019 Aug'))
+
+data_v2 %>% 
+  mutate(Clearances.lag = Clearances_month - lag(Clearances_month)) %>% 
+  ggplot(aes(x = lubridate::month(Month, label = TRUE), y = Clearances.lag)) +
+  geom_boxplot() +
+  labs(title = 'Distribution of Clearance changes by month',
+       subtitle = 'Includes post MODA changes')
+
+data.premoda %>% 
+  mutate(Clearances.lag = Clearances_month - lag(Clearances_month)) %>% 
+  ggplot(aes(x = lubridate::month(Month, label = TRUE), y = Clearances.lag)) +
+  geom_boxplot() +
+  labs(title = 'Distribution of Clearance changes by month',
+       subtitle = 'PRE MODA changes')
+
+```
+
+Given the distribution of each month, we sample one of these values and let it be the "simulated" next value (bootstrap type simulation). We do this a bunch of times and plot the result.
+
+```{r montecarlo}
+next_steps = data.premoda %>% 
+  mutate(Clearances.lag = Clearances_month - lag(Clearances_month)) %>% 
+  group_by(lubridate::month(Month)) %>% 
+  group_split() %>% 
+  map(~.x$Clearances.lag)
+
+names(next_steps) = month.name
+
+```
+
+There is one `NA` value obviously, so let's remove it. I replaced this value with the *66* value which also occurs in March one year, since it is representative somewhat of the data and doesn't introduce too much bias.
+
+```{r remove na}
+# replace
+next_steps$March[1] = 66
+
+next_steps2 = next_steps %>% do.call(rbind, .)
+# This resulted in a 7/12 rows copying values in order to match the required 7 columns. This is not ideal but will work for now.
+
+# test
+next_steps2 = next_steps %>% map(na.omit) %>% do.call(rbind, .)
+
+```
+
+Now to perform a bunch of simulations. Take the data from before
+
+```{r current (pre_moda)}
+data.premoda %>% 
+  ggplot(aes(x = Month, y = Clearances_month)) +
+  geom_line()
+
+```
+
+And the final point:
+
+```{r premoda final}
+data.premoda %>% slice_tail()
+
+```
+
+And from July to the end of the dataset, simulate potential clearances.
+
+```{r tail whole}
+data_v2 %>% slice_tail()
+
+```
+
+
+```{r simulate simulate simulate simulate simulate simulate }
+n = 100000
+
+# We start our simulation in August 2019 and go to August 2021. Create a matrix of potential observations
+
+next_steps3 = next_steps2[8:12,] %>% rbind(next_steps2) %>% rbind(next_steps2[1:8,])
+
+rownames = c(month.name[8:12], month.name, month.name[1:8])
+
+year = c(rep(2019, 5), rep(2020, 12), rep(2021, 8))
+
+rownames = str_c(year, str_sub(rownames, 1, 3), sep = ' ')
+
+# Number of points to simulate
+
+length(rownames)
+nrow(next_steps3)
+
+row.names(next_steps3) = rownames
+
+# next_steps3
+
+
+start = data.premoda %>% slice_tail() %>% pull(Clearances_month)
+
+post_moda_sims = matrix(nrow = n, ncol = nrow(next_steps3))
+
+
+for (i in 1:n){
+  diffs = sample(1:ncol(next_steps3), nrow(next_steps3), replace = TRUE)
+  
+  diffs_i = diffs + ncol(next_steps3) * (0:(nrow(next_steps3)-1))
+  following_steps = t(next_steps3)[diffs_i]
+  
+  post_moda_sims[i,] = start + cumsum(following_steps)
+}
+
+# post_moda_sims[1:10,]
+
+# Just for instance:
+
+# Sample Data
+
+# t = number of visualised simulations <= n (plotting only works for less than 1500)
+# The higher the t the more it looks like a confidence interval.
+t = 100
+sample_data = tibble(Month = rep(yearmonth(rownames), t), 
+                     Clearances_month = c(post_moda_sims[1:t,]),
+                     sim = rep(1:t, each = nrow(next_steps3)))
+
+
+
+data_v2 %>% 
+  ggplot(aes(x = Month, y = Clearances_month)) +
+  geom_line(col = ifelse(data_v2$Month >= yearmonth('2019 Aug'), 'blue', 'red')) +
+  geom_line(data = sample_data, aes(col = as.factor(sim)), alpha = 5/t) +
+  theme(legend.position = 'none')
+
+```
+
+Can we use this data to visualise a distribution?
+
+```{r get_confidence}
+density.data = apply(post_moda_sims, 2, density)
+plot(rev(density.data)[[1]], ylim = c(0, 2e-2), main = 'Density Change over each of the projected days.')
+map2(rev(density.data)[-1], alpha(scales::hue_pal()(nrow(next_steps3)-1), 0.5), function(x, y) lines(x, col = y))
+
+
+```
+
+
+Now to use the Monte Carlo simulated data to estimate the probability of observing what we got. ~~To do this, I will take the cumalitive product of cumalitive probabilities. Make use of the `quantile` function and work under a 2-sided null hypothesis.~~\
+Not sensible for non-parametric bootstrap.
+
+
+```{r estimate ps}
+actual_data = data_v2 %>% filter(Month >= yearmonth('2019 Aug'))
+
+percentiles = numeric(nrow(actual_data))
+
+for (i in 1:length(actual_data$Clearances_month)){
+  booted_data = post_moda_sims[,i]
+  dist_boot = ecdf(booted_data)
+  
+  observed = actual_data$Clearances_month[i]
+  
+  percentiles[i] = dist_boot(observed)
+}
+
+# Want to normalise these percentiles so if they're greater than 0.5, then they are calculated from the right side. Crude and I am sure there is a better way to do this.
+
+percentiles[percentiles > 0.5] = 1 - percentiles[percentiles > 0.5]
+percentiles = percentiles * 2
+
+percentiles
+
+```
+
+Multiplying the probabilities is not sensible here since there were some steps that were . Instead I think it is more wise to determine an "average probability" of observing the 
+
+```{r summary of probabilities}
+summary(percentiles)
+hist(percentiles, breaks = seq(0, 1, 0.01))
+abline(v = 0.05, col = 'red')
+```
+
+
+Maybe a parametric bootstrap is more sensible?\
+To do this, we'll get means and standard deviations of each step and assume normality. 
+
+```{r revise dists}
+data.premoda %>% 
+  mutate(Clearances.lag = Clearances_month - lag(Clearances_month)) %>% 
+  ggplot(aes(x = lubridate::month(Month, label = TRUE), y = Clearances.lag)) +
+  geom_boxplot() +
+  labs(title = 'Distribution of Clearance changes by month',
+       subtitle = 'PRE MODA changes')
+
+(month_dists = data.premoda %>% 
+  mutate(Clearances.lag = Clearances_month - lag(Clearances_month)) %>% 
+  group_by(Month = lubridate::month(Month, label = TRUE, abbr = FALSE)) %>% 
+  summarise(mean = mean(Clearances.lag, na.rm = TRUE), sd = sd(Clearances.lag, na.rm = TRUE)))
+
+means = month_dists$mean
+sds = month_dists$sd
+
+```
+
+
+```{r simulate simulate simulate simulate simulate simulate x2}
+n = 100000
+
+# We start our simulation in August 2019 and go to August 2021. Create a matrix of potential observations
+
+means_recy = c(means[8:12], means, means[1:8])
+sds_recy = c(sds[8:12], sds, sds[1:8])
+
+# Figure out the residuals
+post_moda_sims_para = rnorm(n * length(means_recy), means_recy, sds_recy)
+
+# Convert to a matrix
+post_moda_sims_para = t(matrix(post_moda_sims_para, nrow = length(means_recy)))
+
+# Calculate the cumulative sum and add the start.
+
+for (i in 1:n) post_moda_sims_para[i,] = cumsum(post_moda_sims_para[i,]) + start
+# post_moda_sims_para[1:10,]
+
+
+# Just for instance:
+
+# Sample Data
+
+# t = number of visualised simulations <= n (plotting only works for less than 1500)
+# The higher the t the more it looks like a confidence interval.
+t = 100
+sample_data = tibble(Month = rep(yearmonth(rownames), t), 
+                     Clearances_month = c(post_moda_sims_para[1:t,]),
+                     sim = rep(1:t, each = ncol(post_moda_sims_para)))
+
+
+
+data_v2 %>% 
+  ggplot(aes(x = Month, y = Clearances_month)) +
+  geom_line(col = ifelse(data_v2$Month >= yearmonth('2019 Aug'), 'blue', 'red')) +
+  geom_line(data = sample_data, aes(col = as.factor(sim)), alpha = 5/t) +
+  theme(legend.position = 'none')
+
+```
+
+Can we use this data to visualise a distribution?
+
+```{r get_confidence x2}
+density.data = apply(post_moda_sims_para, 2, density)
+plot(rev(density.data)[[1]], ylim = c(0, 2e-2), main = 'Density Change over each of the projected days.')
+map2(rev(density.data)[-1], alpha(scales::hue_pal()(length(density.data)-1), 0.5), function(x, y) lines(x, col = y))
+
+
+```
+
+
+
+
+```{r estimate ps x2}
+actual_data = data_v2 %>% filter(Month >= yearmonth('2019 Aug'))
+
+percentiles = numeric(nrow(actual_data))
+
+for (i in 1:length(actual_data$Clearances_month)){
+  booted_data = post_moda_sims_para[,i]
+  dist_boot = ecdf(booted_data)
+  
+  observed = actual_data$Clearances_month[i]
+  
+  percentiles[i] = dist_boot(observed)
+}
+
+# Want to normalise these percentiles so if they're greater than 0.5, then they are calculated from the right side. Crude and I am sure there is a better way to do this.
+
+percentiles[percentiles > 0.5] = 1 - percentiles[percentiles > 0.5]
+percentiles = percentiles * 2
+
+percentiles
+
+```
+
+
+
+
+
+```{r summary of probabilities 2}
+summary(percentiles)
+hist(percentiles, breaks = seq(0, 1, 0.01))
+abline(v = 0.05, col = 'red')
+```
+
+
+We can use the `pnorm` function to figure out the actual probability of observing something like this given the monte-carlo assumption.
+
+```{r actual p}
+# goes in order of Aug 2019 - Aug 2021
+actual_lags = actual_data$Clearances_month - lag(actual_data$Clearances_month)
+
+# calculate first lag.
+actual_lags[1] = data_v2[data_v2$Month == yearmonth('2019 August') | data_v2$Month == (yearmonth('2019 August')-1)] %>% pull(Clearances_month) %>% (function(x) {x[2]-x[1]})
+
+# Calculate cumulative probabilities
+probabilities = pnorm(actual_lags, means_recy, sds_recy)
+
+# Convert upper probabilities to lowers and double.
+
+probabilities[probabilities > 0.5] = probabilities[probabilities > 0.5] - 0.5
+
+# Double
+probabilities = probabilities * 2
+
+hist(probabilities, breaks = seq(0, 1, 0.01))
+
+
+# Actual probability is the cumulative product of it all?
+
+# prod(probabilities)
+```
+
+
+
+
+
+Plot the confidence interval over time. Notice that the simulated variance is increasing with time.
+
+```{r variance}
+plot(apply(post_moda_sims_para, 2, var))
+
+```
+
+
+```{r confint on plot}
+simulated_mean = apply(post_moda_sims_para, 2, mean)
+simulated_confint = rep(simulated_mean, each = 2) + c(1, -1) * 2 * rep(apply(post_moda_sims_para, 2, sd), each = 2)
+simulated_confint = simulated_confint %>% matrix(nrow = 2) %>% t()
+
+dates = data_v2[data_v2$Month >= yearmonth('2019 Aug'),]$Month
+
+projection_data = cbind(simulated_mean, simulated_confint, dates) %>% as_tibble() %>% rename('upper' = V2, 'lower' = V3) %>% mutate(dates = as.Date(dates, origin='1970-01-01'))
+
+data_v2 %>% 
+  ggplot(aes(x = Month, y = Clearances_month)) +
+  geom_line(col = ifelse(data_v2$Month >= yearmonth('2019 Aug'), 'black', 'red')) +
+  geom_line(data = projection_data, aes(x = dates, y = simulated_mean), col = 'blue') +
+  geom_ribbon(data = projection_data, aes(x = dates, y = simulated_mean, ymin = lower, ymax = upper), alpha = 0.3, fill = 'blue')
+
+```
+
+
+```{r confint on plot nonpara}
+simulated_mean = apply(post_moda_sims, 2, mean)
+simulated_confint = rep(simulated_mean, each = 2) + c(1, -1) * 2 * rep(apply(post_moda_sims, 2, sd), each = 2)
+simulated_confint = simulated_confint %>% matrix(nrow = 2) %>% t()
+
+dates = data_v2[data_v2$Month >= yearmonth('2019 Aug'),]$Month
+
+projection_data = cbind(simulated_mean, simulated_confint, dates) %>% as_tibble() %>% rename('upper' = V2, 'lower' = V3) %>% mutate(dates = as.Date(dates, origin='1970-01-01'))
+
+data_v2 %>% 
+  ggplot(aes(x = Month, y = Clearances_month)) +
+  geom_line(col = ifelse(data_v2$Month >= yearmonth('2019 Aug'), 'black', 'red')) +
+  geom_line(data = projection_data, aes(x = dates, y = simulated_mean), col = 'blue') +
+  geom_ribbon(data = projection_data, aes(x = dates, y = simulated_mean, ymin = lower, ymax = upper), alpha = 0.3, fill = 'blue')
+
+```
+
+
+
+
+
+
+
+
+
+## I got it
+
+To estimate the probability of a real effect of the legislation change, we can use this simulated data that we have created as "a set of potential outcomes given nothing has changed".\
+We then estimate some statistic to show lack of fit such as RSS. We calculate the RSS of the actual data given our model, and use the simulated data to also calculate their RSS. \
+We then figure out the proportion of the simulated RSS values are *greater* than the actual RSS given the fitted model, and that is out p-value. (greater since a worse fit is less likely under the assumption of no change).\
+
+```{r our fitted model}
+fc_data = best_fc %>% as_tibble() %>% select(Month, .mean)
+
+data_v2 %>% 
+  ggplot(aes(x = Month, y = Clearances_month)) +
+  geom_line(col = ifelse(data_v2$Month >= yearmonth('2019 Aug'), 'black', 'red')) +
+  geom_line(data = fc_data, aes(x = Month, y = .mean), col = 'blue')
+
+```
+
+Can we please figure out how to get random number from the distribution objects given in the model?
+
+```{r dists}
+best_fc$Clearances_month
+```
+
+
+
+We'll use my model now just for reference.
+
+```{r my model}
+parametric_rss = apply(sweep(post_moda_sims_para, 2, projection_data$simulated_mean)^2, 1, sum)
+nonpara_rss = apply(sweep(post_moda_sims, 2, projection_data$simulated_mean)^2, 1, sum)
+
+actual_rss = sum((projection_data$simulated_mean - actual_data$Clearances_month)^2)
+
+hist(parametric_rss)
+abline(v = actual_rss, col = 'red')
+
+# P-value
+(p_val = sum(parametric_rss > actual_rss) / length(nonpara_rss))
+```
+
+
+That is just `r p_val %>% round(3)*100`% significance.
+
+
+
+
+
+## Now with the actually good model
+
+```{r get fit}
+ts.model = pre_moda %>%
+  model(ARIMA101110 = ARIMA(box_cox(Clearances_month, lambda) ~ pdq(1, 0, 1) + PDQ(1,1,0)))
+
+# ts.model %>% glance()
+
+huh = ts.model %>% forecast(h=36) %>% hilo(level = 95) %>% unpack_hilo('95%')
+
+huh %>% 
+  mutate(mean_t = box_cox(.mean, lambda),
+         lower_t = box_cox(`95%_lower`, lambda),
+         upper_t = box_cox(`95%_upper`, lambda)) %>% 
+  ggplot(aes(x = Month, y = mean_t)) +
+  geom_line() +
+  geom_line(aes(y = lower_t)) +
+  geom_line(aes(y = upper_t))
+  
+huh %>% 
+  ggplot(aes(x = Month, y = .mean)) +
+  geom_line() +
+  geom_line(aes(y = `95%_lower`)) +
+  geom_line(aes(y = `95%_upper`))
+  
+```
+
+When we apply the box cox transformation on the data, the distribution looks roughly normal. Therefore assume that the distribution is normal in the domain of the box_cox. To extract the standard deviation, we can use the following formula:
+
+$$\mu + 1.96 \times \sigma = upper$$
+
+$$\implies \sigma = \frac{upper - \mu}{1.96}$$
+
+Likewise for lower. Ideally they should be about the same, although on observation of the graph above, it doesn't look like it. A safe bet would be to take the average standard deviation between the two.
+
+
+```{r calculating distributions}
+# 1.96 is an approximation for the 97.5% percentile. Call the true value t
+(t = qnorm(0.975))
+
+huh_t = huh %>% 
+  mutate(mean_t = box_cox(.mean, lambda),
+         lower_t = box_cox(`95%_lower`, lambda),
+         upper_t = box_cox(`95%_upper`, lambda))
+
+# Mean sd 
+sds = ((huh_t$upper_t - huh_t$mean_t) / t + (huh_t$lower_t - huh_t$mean_t) / -t) / 2
+sds
+
+
+huh_t %>% as_tibble() %>% 
+  cbind(sds) %>% as_tibble() %>% 
+  ggplot(aes(x = Month, y = mean_t)) +
+  geom_line() +
+  geom_line(aes(y = lower_t)) +
+  geom_line(aes(y = upper_t)) +
+  geom_ribbon(aes(ymin = mean_t - sds * 2, ymax = mean_t + sds * 2), alpha = 0.3, fill = 'blue')
+
+```
+
+Seems to do a decent job of representing the distribution. As expected it overestimates the upper and underestimates the lower. Now we can use it to simulate some data!
+
+```{r simulate simulate simulate }
+huh_t = huh_t %>% as_tibble() %>% 
+  cbind(sds) %>% as_tibble() %>% 
+  filter(Month < yearmonth('2021 Sep'))
+
+
+sim_data = huh_t %>% select(Month, mean_t, sds)
+
+sim_matrix = as.matrix(sim_data[,2:3])
+row.names(sim_matrix) = (sim_data$Month %>% as.character())
+
+sim_matrix
+
+n = 100000
+
+# Generate the data :D
+parametric_ts_sims = rnorm(n * nrow(sim_matrix), sim_matrix[,1], sim_matrix[,2])
+parametric_ts_sims[1:10]
+
+# Transform the data with inverse box cox NO DONT DO THAT! BAD! DO IT LATER!
+# parametric_ts_sims_t = inv_box_cox(parametric_ts_sims, lambda)
+# parametric_ts_sims_t[1:10]
+
+# Convert to matrix
+parametric_ts_sims_matrix = t(matrix(parametric_ts_sims, nrow = nrow(sim_matrix)))
+dim(parametric_ts_sims_matrix)
+
+# Visualise
+simulated_confint = inv_box_cox(rep(sim_matrix[,1], each = 2) + c(1, -1) * 2 * rep(apply(parametric_ts_sims_matrix, 2, sd), each = 2), lambda)
+simulated_confint = simulated_confint %>% matrix(nrow = 2) %>% t()
+
+
+proj_data = sim_data %>% 
+  cbind(simulated_confint) %>% 
+  as_tibble() %>% rename('lower' = `1`, 'upper' = `2`) %>% 
+  mutate(mean = inv_box_cox(mean_t, lambda))
+
+
+data_v2 %>% 
+  ggplot(aes(x = Month, y = Clearances_month)) +
+  geom_line() +
+  geom_line(data = proj_data, aes(y = mean), col = 'blue') +
+  geom_ribbon(data = proj_data, aes(y = mean, ymin = lower, ymax = upper), fill = 'blue', alpha = 0.3)
+
+```
+
+Now to actually calculate the p_value
+
+```{r final p}
+predicted_post_moda = huh_t$.mean
+actual_post_moda = data_v2 %>% filter(Month >= yearmonth('2019 Aug')) %>% 
+  pull(Clearances_month)
+
+# rss of the actual data against model
+(rss_actual = sum((predicted_post_moda - actual_post_moda)^2))
+
+# get the rss of the simulated data
+rss_sim = apply((sweep(inv_box_cox(parametric_ts_sims_matrix, lambda), 2, predicted_post_moda))^2, 1, sum)
+
+# plot (filter first)
+
+hist(rss_sim[rss_sim < 2e7])
+abline(v = rss_actual, col = 'red')
+
+# p
+sum(rss_sim > rss_actual) / length(rss_sim)
+
+```
+
+No effect! 
+
+
+
+## Nice Plots
+
+```{r residual sum sq}
+tibble(residuals = rss_sim) %>% 
+  ggplot(aes(x = residuals)) +
+  geom_histogram(bins = 500) +
+  xlim(c(0, 2.5e6)) +
+  geom_vline(xintercept = rss_actual, col = 'red', lty = 2) +
+  bbc_style() +
+  labs(title = 'Simulated RSS fits',
+       subtitle = 'A higher RSS implies simulated trend is less likely to have come from Model Distribution.',
+       x = 'Residual Sum of Squares (RSS value)', y = 'Frequency of simulated trends', caption = 'Observed data fit.') +
+  theme(plot.subtitle = element_text(size = 10),
+        axis.title = element_text(size = 15),
+        plot.caption = element_text(size = 10, colour = 'red'))
+  
+
+```
+
+
+
+
